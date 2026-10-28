@@ -160,8 +160,15 @@ class WireBody:
                 if v:targets.append(v)
         return list(dict.fromkeys(symbol(v) for v in targets if re.fullmatch(IDENT,v)))
 
-# ST subset parser. Parse failures block the whole body, never degrade to proximity matching.
-ST_TOKEN=re.compile(r"\s+|//[^\n]*|\(\*.*?\*\)|'(?:''|[^'])*'|:=|\.\.|<>|>=|<=|[();,:=<>]|[^\s();,:=<>]+",re.S)
+# ST subset parser. Structural parse failures (IF/CASE mismatch, unsupported
+# flow keywords) still block the whole body, never degrade to proximity matching.
+# Recognized call/RETURN/opaque statements degrade to recorded skips
+# (self.skipped) so the body's provable writes survive; callers must surface
+# the skip list in warnings/audit — a skip is uncertainty kept, not silence.
+# '/' is excluded from bare symbols so a line comment glued to code
+# (e.g. `AND//comment`) terminates the symbol and the `//...` rule wins.
+# Division was never supported; dropping the '/' token changes nothing there.
+ST_TOKEN=re.compile(r"\s+|//[^\n]*|\(\*.*?\*\)|'(?:''|[^'])*'|:=|\.\.|<>|>=|<=|[();,:=<>]|[^\s();,:=<>\\/]+",re.S)
 def st_tokens(s):
     ts=[]
     for m in ST_TOKEN.finditer(s):
@@ -172,8 +179,15 @@ def st_tokens(s):
     return ts
 
 class STParser:
-    def __init__(self,s,condition_parser=None):
-        self.ts=st_tokens(s);self.i=0;self.writes=[];self.actions=[];self.condition_parser=condition_parser or parse
+    def __init__(self,s,condition_parser=None,strict=True):
+        # strict=True (default): any call/opaque/string/expression statement
+        # blocks the body — required for InlineST tail slices whose merge
+        # premise is a zero-side-effect proof (v9.11, locked by tests).
+        # strict=False: those statements degrade to recorded skips so a large
+        # section body keeps its provable writes. Skips are always surfaced.
+        self.strict=strict
+        self.ts=st_tokens(s);self.i=0;self.writes=[];self.actions=[];self.skipped=[]
+        self.condition_parser=condition_parser or parse
     def is_(self,*words):return self.i<len(self.ts) and self.ts[self.i].upper() in words
     def pop(self,word=None):
         if self.i>=len(self.ts) or (word and not self.is_(word)):raise WireError('ST expected '+str(word))
@@ -206,12 +220,15 @@ class STParser:
             if self.is_(';'):self.pop();continue
             if self.is_('IF'):
                 self.pop();cond=self.condition_parser(self.until('THEN'));seen=cond
-                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'))
+                # case_context must survive nested IF/ELSIF/ELSE bodies: a CASE
+                # branch label after an (unclosed) inner IF is a branch boundary,
+                # never a statement.
+                self.seq(combine('and',guard,cond),('ELSIF','ELSE','END_IF'),case_context)
                 while self.is_('ELSIF'):
                     self.pop();cond=self.condition_parser(self.until('THEN'))
-                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'))
+                    self.seq(combine('and',guard,negate(seen),cond),('ELSIF','ELSE','END_IF'),case_context)
                     seen=combine('or',seen,cond)
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_IF',))
+                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_IF',),case_context)
                 self.pop('END_IF')
             elif self.is_('CASE'):
                 self.pop();var=symbol(self.until('OF'))
@@ -222,18 +239,47 @@ class STParser:
                     if not lab:raise WireError('ST invalid CASE label')
                     self.i,vals=lab;cond=combine('or',*(Expr('eq',(var,v)) for v in vals));seen=combine('or',seen,cond)
                     self.seq(combine('and',guard,cond),('ELSE','END_CASE'),True)
-                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_CASE',))
+                if self.is_('ELSE'):self.pop();self.seq(combine('and',guard,negate(seen)),('END_CASE',),True)
                 self.pop('END_CASE')
             elif self.is_('FOR','WHILE','REPEAT','JMP','RETURN','EXIT','CONTINUE','GOTO'):
+                # RETURN blocks: statements after it are unreachable this scan;
+                # extracting them would fabricate linear transitions (v9.11).
                 raise WireError('ST unsupported flow '+self.pop())
             else:
                 begin=self.i;stmt=self.until(';')
-                if ':=' not in stmt:raise WireError('ST opaque call/statement may write state')
-                lhs,rhs=stmt.split(':=',1);lhs=symbol(lhs);rhs=rhs.strip()
-                if not re.fullmatch(IDENT,lhs):raise WireError('ST invalid assignment target')
+                good_lhs=':=' in stmt and re.fullmatch(IDENT,symbol(stmt.split(':=',1)[0]))
+                if not good_lhs:
+                    if self.strict:
+                        raise WireError('ST invalid assignment target' if '(' in stmt
+                                        else 'ST opaque call/statement may write state')
+                    # Calls and RETURN degrade to recorded skips, not body loss:
+                    # a call may write state we cannot prove, but the rest of the
+                    # body still yields provable writes. The skip list is surfaced
+                    # by the caller (warnings/audit) and never silently dropped.
+                    if stmt.upper()=='RETURN':reason='st_return_no_direct_state_effect'
+                    elif '(' in stmt:reason='st_call_may_write_state'
+                    else:reason='st_opaque_statement_may_write_state'
+                    self.skipped.append({'token':begin,'reason':reason,'stmt':stmt[:200]})
+                    continue
+                lhs=symbol(stmt.split(':=',1)[0]);rhs=stmt.split(':=',1)[1].strip()
                 if rhs.upper() in ('TRUE','FALSE'):
                     self.actions.append({'variable':lhs,'value':rhs.upper(),'guard':guard.text(),'token':begin})
-                else:self.writes.append((lhs,integer(rhs),guard,begin,rhs))
+                elif self.strict:
+                    self.writes.append((lhs,integer(rhs),guard,begin,rhs))
+                elif '__STRING_UNSUPPORTED__' in rhs:
+                    # String assignment (step info texts etc.): integer state
+                    # extraction cannot represent it, but it must not veto the
+                    # provable writes in the same body. Recorded as a skip.
+                    self.skipped.append({'token':begin,'reason':'st_string_assignment_unmodeled_effects','stmt':stmt[:200]})
+                else:
+                    rt=[t for t in st_tokens(rhs)]
+                    if len(rt)==1 and (re.fullmatch(IDENT,rt[0]) or integer(rt[0]) is not None):
+                        self.writes.append((lhs,integer(rhs),guard,begin,rhs))
+                    else:
+                        # Boolean/arithmetic expression RHS (bBusy := a OR b):
+                        # no single-integer state write is representable; skip
+                        # with an audit record instead of losing the body.
+                        self.skipped.append({'token':begin,'reason':'st_expression_assignment_unmodeled_effects','stmt':stmt[:200]})
 
 
 def collect(source):
@@ -282,6 +328,8 @@ def collect(source):
                     parser.seq()
                     for var,dest,guard,pos,rhs in parser.writes:emit(scope,pou,body_id,var,dest,guard,'st_structured_guard',[f'token:{pos}'])
                     observations.extend({**a,'scope':scope,'source':'ST_bool_assignment'} for a in parser.actions)
+                    for s in parser.skipped:
+                        warnings.append(f"{body_id}: skipped ST statement token {s['token']} {s['reason']}: {s['stmt'][:80]}")
                 except (WireError,BoundarySyntaxError) as e:
                     vars_=set(re.findall(rf'({IDENT})\s*:=',code))
                     for v in vars_:block(scope,symbol(v),'unsupported_ST_body:'+str(e),None,binding(symbol(v),scope,pou))

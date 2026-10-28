@@ -6,7 +6,8 @@
     "websearch": "deny",
     "external_directory": "ask",
     "skill": {
-      "plc-boundary-normalization": "allow"
+      "plc-boundary-normalization": "allow",
+      "plc-coverage-evaluation": "allow"
     }
   }
 }

@@ -280,7 +280,7 @@ def collect_native(source):
                 'path':path,'timing_proof':'local_port_guard_only; scan visibility and physical completion unproved'})
             add_stage(v,src,dest,g.text(),evidence!='omron_native_symbolic_guard',scope,network,tid,line,comment,bscope,path,evidence)
     def parse_st(code,scope,network,node,line,comment,pou,external=TRUE,external_issue=None,
-                 connected_seeds=(),symbolic_external=False,temporal=()):
+                 connected_seeds=(),symbolic_external=False,temporal=(),strict=True):
         from source_expressions import SourceConditions,scalar_reads,valid_scalar
         clean=' '.join(st_tokens(code));writes=set();conditions=SourceConditions()
         effect={'scope':scope,'network':str(network),'node':node,'source_line':line,'comment':comment,
@@ -294,11 +294,15 @@ def collect_native(source):
             v=symbol(m.group(1));n=integer(m.group(2));writes.add(v)
             if n is not None:observe(v,n,'st_assignment',scope,network,node,line,comment,binding_of(v,scope,pou))
         try:
-            parser=STParser(code,condition_parser=conditions.parse);parser.seq()
+            parser=STParser(code,condition_parser=conditions.parse,strict=strict);parser.seq()
             for v,dest,g,pos,rhs in parser.writes:
                 if dest is None and not valid_scalar(rhs):
                     raise WireError('ST opaque/non-scalar assignment RHS may have effects')
             effect['flow_complete']=True
+            if parser.skipped:
+                effect['skipped_statements']=parser.skipped
+                stats['skipped_st_statements']+=len(parser.skipped)
+                warnings.append(f'{scope}/{network}/line:{line}: {len(parser.skipped)} ST statement(s) skipped (call/return/opaque); their state effects are unmodeled')
             effect['assignments']=[{'target':v,'value':rhs,'integer':dest,'guard':g.text(),
                 'reads':scalar_reads(rhs),'token':pos} for v,dest,g,pos,rhs in parser.writes]
             effect['assignments'] += [{'target':x['variable'],'value':x['value'],'integer':None,
@@ -334,17 +338,39 @@ def collect_native(source):
             if writes:warnings.append(f'{scope}/{network}/line:{line}: {ex}')
         inline_slices.append(effect)
     # ST nested inside InlineST is consumed with its rung exactly once.
+    rung_consumed=set();body_audit={'parsed_st':{},'rung_path':{},'skipped_unknown':{}}
     for _,e in etree.iterparse(str(source),events=('end',),tag=('{*}Rung','{*}BodyContent'),
                                huge_tree=True,resolve_entities=False,no_network=True):
         if local(e)=='BodyContent':
-            if kind(e) in ('ST','STBody','StructuredText'):
+            # Horizontal-defense: recognize ST bodies by STRUCTURE (a direct
+            # <ST> child), not only by enumerating vendor xsi:type names.
+            # Name enumeration missed smcext:StSection (Sysmac's own ST section
+            # type) and would miss every future vendor spelling; a <ST> child
+            # is what IEC 61131-10 itself guarantees for a text body. Direct
+            # children only: LdSection/LD keep their Rungs out of this path.
+            # Every BodyContent is classified in body_audit — unread vendor
+            # types are reported, never silently dropped.
+            st_kids=direct(e,'ST');ksig=e.get(XSI,'') or local(e)
+            if kind(e) in ('ST','STBody','StructuredText','StSection') or st_kids:
                 scope,pou=scope_of(e);scope+='::'+e.get('name','ST')
-                parse_st(content(e),scope,e.get('evaluationOrder','ST'),'ST',e.sourceline or 0,'',pou)
+                code='\n'.join(content(x) for x in st_kids) if st_kids else content(e)
+                # Section bodies are large state machines: unprovable statements
+                # (calls, texts, expressions) degrade to skips. InlineST inside
+                # rungs keeps strict=True (zero-side-effect tail premise).
+                parse_st(code,scope,e.get('evaluationOrder','ST'),'ST',e.sourceline or 0,'',pou,strict=False)
                 stats['structured_text_bodies']+=1
+                body_audit['parsed_st'][ksig]=body_audit['parsed_st'].get(ksig,0)+1
+            elif id(e) in rung_consumed:
+                body_audit['rung_path'][ksig]=body_audit['rung_path'].get(ksig,0)+1
+            else:
+                body_audit['skipped_unknown'][ksig]=body_audit['skipped_unknown'].get(ksig,0)+1
+            rung_consumed.discard(id(e))
             e.clear()
             while e.getprevious() is not None and local(e.getprevious())=='BodyContent':del e.getparent()[e.getparent().index(e)-1]
             continue
         rung=e;scope,pou=scope_of(rung);units.add(scope);network=rung.get('evaluationOrder',str(stats['rungs']))
+        parent=rung.getparent()
+        if parent is not None and local(parent)=='BodyContent':rung_consumed.add(id(parent))
         line=rung.sourceline or 0;stats['rungs']+=1
         comment='\n'.join(content(c) for c in rung if kind(c)=='Comment')
         wire=NativeRung(rung);cmps={};compared=defaultdict(set);commands=[]
@@ -462,6 +488,9 @@ def collect_native(source):
                 block(v,scope,network,node,'opaque_function_state_writer',state_bindings.get((v,scope),''))
     if not stats['rungs'] and not stats['structured_text_bodies']:
         raise ValueError('Native IEC61131-10 XML detected but no supported Rung/ST body was read; cannot return success.')
+    if body_audit['skipped_unknown']:
+        warnings.append('BodyContent types never read (no <ST> child, no Rung consumed): '+
+            json.dumps(body_audit['skipped_unknown'],ensure_ascii=False,sort_keys=True))
     stats.update({'state_observations':len(states),'transitions':len(transitions),'partial_transitions':len(partial),
         'events':len(events),'stage_records':len(stages),'units':len(units)})
     h=hashlib.sha256()
@@ -475,6 +504,7 @@ def collect_native(source):
         'native_partial_transitions':partial,'native_inline_slices':inline_slices,
         'source_predicates':source_predicates,'temporal_dependencies':temporal_dependencies,'native_rung_inventory':discovery,
         'native_parse_audit':{'format':'omron_iec61131_10','counts':dict(stats),'object_types':dict(types),
+            'bodycontent_audit':body_audit,
             'health':'parsed_with_explicit_limits','no_pattern_applied_during_parse':True,
             'gt_access':False,'warnings':['Local guards only; unresolved control paths are retained, not certified.']},
         'summary':{'bodies':stats['rungs']+stats['structured_text_bodies'],'transitions':len(transitions),

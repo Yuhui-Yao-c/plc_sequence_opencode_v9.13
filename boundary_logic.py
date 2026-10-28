@@ -1,6 +1,10 @@
 """Small, fail-closed Boolean grammar for boundary labels (not a full ST compiler).
 Whitespace/case/integer types and same-level AND/OR order are canonicalized.
 Missing operators, arithmetic, and shorthand `S=1 OR 2` are NEVER repaired silently.
+Equality/inequality between two symbols, ordering comparisons (var op integer)
+and 2#/8#/16# based literals are parsed as opaque atoms: they are preserved
+verbatim in guard text, can never anchor a positive state, and count as
+"possible" in satisfiability checks (never proofs).
 """
 from __future__ import annotations
 from dataclasses import dataclass
@@ -10,12 +14,15 @@ from typing import Iterable
 class BoundarySyntaxError(ValueError): pass
 
 IDENT = r'[^\W\d]\w*(?:\s*\[(?:[^\[\]]|\[[^\[\]]*\])+\])*(?:\s*\.\s*[^\W\d]\w*(?:\s*\[(?:[^\[\]]|\[[^\[\]]*\])+\])*)*'
-NUM = r'(?:(?:SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|BYTE|WORD|DWORD|LWORD)\s*#\s*)?[+-]?\d+'
-TOKEN = re.compile(rf'\s*(?:(?P<num>{NUM})(?![\w#])|(?P<id>{IDENT})|(?P<op><>|!=|==|=|[()]))', re.I)
+NUM = r'(?:(?:2|8|16)\s*#\s*[0-9A-Fa-f]+|(?:(?:SINT|USINT|INT|UINT|DINT|UDINT|LINT|ULINT|BYTE|WORD|DWORD|LWORD)\s*#\s*)?[+-]?\d+)'
+TOKEN = re.compile(rf'\s*(?:(?P<num>{NUM})(?![\w#])|(?P<id>{IDENT})|(?P<op><>|!=|==|>=|<=|>|<|=|[()]))', re.I)
 
 def integer(s: str) -> int | None:
-    if not re.fullmatch(NUM, str(s).strip(), re.I): return None
-    return int(str(s).split('#')[-1].strip())
+    s=str(s).strip()
+    m=re.fullmatch(r'(2|8|16)\s*#\s*([0-9A-Fa-f]+)',s,re.I)
+    if m: return int(m[2],int(m[1]))
+    if not re.fullmatch(NUM,s,re.I): return None
+    return int(s.split('#')[-1].strip())
 
 def symbol(s: str) -> str: return re.sub(r'\s+', '', s)
 
@@ -26,13 +33,18 @@ class Expr:
     def text(self) -> str:
         if self.kind == 'const': return 'TRUE' if self.args[0] else 'FALSE'
         if self.kind == 'signal': return self.args[0]
-        if self.kind in ('eq','ne'): return f'{self.args[0]}{"=" if self.kind=="eq" else "<>"}{self.args[1]}'
+        if self.kind == 'opaque_cmp': return self.args[0]
+        if self.kind in ('eq','ne','veq','vne','gt','lt','ge','le'):
+            sym={'eq':'=','ne':'<>','veq':'=','vne':'<>','gt':'>','lt':'<','ge':'>=','le':'<='}[self.kind]
+            return f'{self.args[0]}{sym}{self.args[1]}'
         if self.kind == 'not': return f'NOT ({self.args[0].text()})'
-        return (' '+self.kind.upper()+' ').join('('+x.text()+')' if x.kind in ('and','or') and x.kind!=self.kind else x.text() for x in self.args)
+        return (' '+self.kind.upper()+' ').join('('+x.text()+')' if x.kind in ('and','or','xor') and x.kind!=self.kind else x.text() for x in self.args)
     def key(self) -> tuple:
         if self.kind in ('eq','ne'): return self.kind, self.args[0].casefold(), self.args[1]
+        if self.kind in ('veq','vne','gt','lt','ge','le'): return self.kind, self.args[0].casefold(), str(self.args[1])
         if self.kind=='signal': return self.kind, self.args[0].casefold()
         if self.kind=='const': return self.kind, self.args[0]
+        if self.kind=='opaque_cmp': return self.kind, re.sub(r'\s+','',self.args[0]).casefold()
         return self.kind, tuple(x.key() for x in self.args)
 
 TRUE=Expr('const',(True,)); FALSE=Expr('const',(False,))
@@ -53,6 +65,8 @@ def negate(x: Expr) -> Expr:
     if x.kind=='const': return TRUE if not x.args[0] else FALSE
     if x.kind=='not': return x.args[0]
     if x.kind in ('eq','ne'): return Expr('ne' if x.kind=='eq' else 'eq',x.args)
+    if x.kind in ('veq','vne'): return Expr('vne' if x.kind=='veq' else 'veq',x.args)
+    if x.kind in ('gt','lt','ge','le'): return Expr({'gt':'le','le':'gt','lt':'ge','ge':'lt'}[x.kind],x.args)
     if x.kind in ('and','or'): return combine('or' if x.kind=='and' else 'and',*(negate(a) for a in x.args))
     return Expr('not',(x,))
 
@@ -74,23 +88,48 @@ class Parser:
         if self.i!=len(self.tokens): raise BoundarySyntaxError(f'Missing operator near {self.tokens[self.i:]}')
         return x
     def or_(self):
-        xs=[self.and_()]
-        while self.is_('OR'): self.eat();xs.append(self.and_())
+        xs=[self.xor_()]
+        while self.is_('OR'): self.eat();xs.append(self.xor_())
         return combine('or',*xs)
+    def xor_(self):
+        # XOR stays a structural node, NOT booleanized: byte-wise XOR compared
+        # against a mask has different semantics than boolean XOR. It never
+        # anchors a positive state and counts as "possible" in satisfiability.
+        xs=[self.and_()]
+        while self.is_('XOR'): self.eat();xs.append(self.and_())
+        return xs[0] if len(xs)==1 else Expr('xor',tuple(xs))
     def and_(self):
         xs=[self.unary()]
         while self.is_('AND'): self.eat();xs.append(self.unary())
         return combine('and',*xs)
     def unary(self):
         if self.is_('NOT'): self.eat();return negate(self.unary())
-        if self.is_('('): self.eat();x=self.or_();self.eat(')');return x
+        if self.is_('('):
+            self.eat();x=self.or_();self.eat(')')
+            if self.is_('=','==','<>','!=','>=','<=','>','<'):
+                # Parenthesized expression compared against something: the
+                # left side's evaluation semantics are unknown (bit ops etc.);
+                # keep the comparison verbatim as an opaque atom.
+                op=self.eat()[1];typ2,b=self.eat()
+                return Expr('opaque_cmp',(f'({x.text()}){op}{b}',))
+            return x
         typ,a=self.eat()
         if a.upper() in ('TRUE','FALSE'): return TRUE if a.upper()=='TRUE' else FALSE
-        if self.is_('=','==','<>','!='):
+        if self.is_('=','==','<>','!=','>=','<=','>','<'):
             op=self.eat()[1];typ2,b=self.eat();n=integer(b);v=a
-            if typ=='num' and typ2=='id': n=integer(a);v=b
-            if n is None or not re.fullmatch(IDENT,v): raise BoundarySyntaxError('Only symbol/integer comparisons supported')
-            return Expr('eq' if op in ('=','==') else 'ne',(symbol(v),n))
+            if typ=='num' and typ2=='id':
+                n=integer(a);v=b
+                op={'<':'>','>':'<','<=':'>=','>=':'<='}.get(op,op)
+            if n is None:
+                # Symbol-symbol equality/inequality (incl. `x = TRUE`): opaque
+                # atom, never a positive state anchor, kept verbatim in guards.
+                if op in ('=','==','<>','!=') and re.fullmatch(IDENT,a) and re.fullmatch(IDENT,b):
+                    return Expr('veq' if op in ('=','==') else 'vne',(symbol(a),symbol(b)))
+                raise BoundarySyntaxError('Only symbol/integer comparisons supported')
+            if not re.fullmatch(IDENT,v): raise BoundarySyntaxError('Only symbol/integer comparisons supported')
+            if op in ('=','=='):return Expr('eq',(symbol(v),n))
+            if op in ('<>','!='):return Expr('ne',(symbol(v),n))
+            return Expr({'>':'gt','<':'lt','>=':'ge','<=':'le'}[op],(symbol(v),n))
         if typ!='id' or a.upper() in ('OR','AND'): raise BoundarySyntaxError('Expected signal or state comparison')
         return Expr('signal',(symbol(a),))
 

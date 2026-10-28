@@ -68,6 +68,7 @@ def discover(graph:dict,max_hops:int=16)->dict:
             all_commands=cmds.get((sl['scope'],v.casefold(),n),[])
             nonhelper=[c for c in all_commands if c['command'].upper() not in TIMERS]
             if not sl.get('flow_complete'):reasons.append('unsupported_inline_control_flow')
+            if sl.get('skipped_statements'):reasons.append('skipped_st_call_may_write_state')
             if sl.get('external_issue'):reasons.append('unresolved_external_enable')
             if len(state_writes)!=1 or state_writes[0].get('integer') is None or state_writes[0].get('guard')!='TRUE':
                 reasons.append('tail_needs_one_unconditional_literal_state_assignment')
